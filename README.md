@@ -18,7 +18,8 @@ python -m unittest discover -s tests -v
 - 只有负责人或被单独授权的编辑可以修改对应版本；其他用户只有查看权限。
 - `[缺页]`、`[不可辨]`、`[残损]` 等标记会参与校勘稿导出和缺口统计，不匹配的方括号会拒绝保存。
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
-- 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
+- 负责人或被授予 `review` 权限的审阅人可认可异文当前层并附评语；每条异文需两名不同审阅人认可，录入人自己不算；内容或理由进入新层后，旧层认可自动作废但保留留痕。
+- 锁定段落由负责人执行，锁定前该段落每条异文的当前层都必须已获双人认可，锁定后任何新修订都会被拒绝；快照和校勘稿会带出审阅人与评语。
 
 ## 主要接口
 
@@ -27,6 +28,7 @@ python -m unittest discover -s tests -v
 - `POST /api/works/{id}/passages`、`POST /api/works/{id}/access`
 - `POST /api/alignments`
 - `POST /api/variants`、`POST /api/variants/{id}/revisions`
+- `POST /api/variants/{id}/approvals`
 - `GET /api/passages/{id}/snapshots/{revision}?user_id=...`
 - `POST /api/passages/{id}/lock`
 - `GET /api/works/{id}/collation?user_id=...`

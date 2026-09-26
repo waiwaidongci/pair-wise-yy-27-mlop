@@ -13,6 +13,7 @@ class DomainError(ValueError):
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
+REQUIRED_APPROVALS = 2
 
 
 def validate_transcription(text: str) -> str:
@@ -144,6 +145,15 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS variant_approvals (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+              layer INTEGER NOT NULL,
+              reviewer_id INTEGER NOT NULL REFERENCES users(id),
+              comment TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(variant_id,layer,reviewer_id)
+            );
             """
         )
         self.conn.commit()
@@ -221,6 +231,14 @@ class CollationDB:
         owner = self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (row["work_id"], user_id)).fetchone()
         editor = self.conn.execute("SELECT 1 FROM witness_editors WHERE witness_id=? AND user_id=?", (witness_id, user_id)).fetchone()
         return bool(owner or editor)
+
+    def can_review_work(self, work_id: int, user_id: int) -> bool:
+        if self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone():
+            return True
+        return bool(self.conn.execute(
+            "SELECT 1 FROM work_access WHERE work_id=? AND user_id=? AND permission='review'",
+            (work_id, user_id),
+        ).fetchone())
 
     def add_witness(self, work_id: int, siglum: str, kind: str, source_note: str = "", missing_sections: str = "") -> int:
         if not self.conn.execute("SELECT 1 FROM works WHERE id=?", (work_id,)).fetchone():
@@ -315,6 +333,7 @@ class CollationDB:
             if len(reason.strip()) < 3:
                 raise DomainError("取舍理由至少3个字符")
             layer = int(self.conn.execute("SELECT COALESCE(MAX(layer),0)+1 FROM variants WHERE passage_id=? AND witness_id=?", (variant["passage_id"], variant["witness_id"])).fetchone()[0])
+            # 认可按层留痕：内容或理由进入新层后，旧层认可自动作废
             self.conn.execute(
                 "UPDATE variants SET proposed_text=?,reason=?,layer=?,updated_at=? WHERE id=?",
                 (text, reason.strip(), layer, datetime.now().isoformat(), variant_id),
@@ -367,11 +386,64 @@ class CollationDB:
             )
         return int(cur.lastrowid)
 
+    def _layer_author(self, variant_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT author_id FROM revisions WHERE variant_id=? ORDER BY revision_no DESC LIMIT 1",
+            (variant_id,),
+        ).fetchone()
+        return row["author_id"] if row else None
+
+    def _layer_approvals(self, variant_id: int, layer: int) -> list:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT a.id,a.variant_id,a.layer,a.reviewer_id,u.name AS reviewer_name,a.comment,a.created_at "
+            "FROM variant_approvals a JOIN users u ON u.id=a.reviewer_id "
+            "WHERE a.variant_id=? AND a.layer=? ORDER BY a.id",
+            (variant_id, layer),
+        ).fetchall()]
+
+    def approve_variant(self, variant_id: int, reviewer_id: int, comment: str) -> int:
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant:
+            raise DomainError("异文记录不存在")
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (variant["passage_id"],)).fetchone()
+        if passage["status"] == "locked" or self.conn.execute(
+            "SELECT 1 FROM passage_locks WHERE passage_id=?", (passage["id"],)
+        ).fetchone():
+            raise DomainError("段落已锁定，不能审阅")
+        if not self.can_review_work(passage["work_id"], reviewer_id):
+            raise DomainError("无审阅权限，不能认可异文")
+        if self._layer_author(variant_id) == reviewer_id:
+            raise DomainError("录入人不能认可自己录入的当前层")
+        if not comment.strip():
+            raise DomainError("评语不能为空")
+        if self.conn.execute(
+            "SELECT 1 FROM variant_approvals WHERE variant_id=? AND layer=? AND reviewer_id=?",
+            (variant_id, variant["layer"], reviewer_id),
+        ).fetchone():
+            raise DomainError("该审阅人已认可过当前层")
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO variant_approvals(variant_id,layer,reviewer_id,comment,created_at) VALUES(?,?,?,?,?)",
+                (variant_id, variant["layer"], reviewer_id, comment.strip(), datetime.now().isoformat()),
+            )
+        return int(cur.lastrowid)
+
+    def _unendorsed_variants(self, passage_id: int) -> list:
+        pending = []
+        for variant in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY id", (passage_id,)).fetchall():
+            approvers = {a["reviewer_id"] for a in self._layer_approvals(variant["id"], variant["layer"])}
+            if len(approvers) < REQUIRED_APPROVALS:
+                pending.append(variant["id"])
+        return pending
+
     def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        pending = self._unendorsed_variants(passage_id)
+        if pending:
+            raise DomainError(f"异文 {','.join(map(str, pending))} 的当前层未获两名审阅人认可，不能定稿")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
@@ -386,7 +458,10 @@ class CollationDB:
         row = self.conn.execute("SELECT * FROM revisions WHERE passage_id=? AND revision_no=?", (passage_id, revision_no)).fetchone()
         if not row:
             raise DomainError("快照不存在")
-        return {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": json.loads(row["snapshot_json"])}
+        snapshot = json.loads(row["snapshot_json"])
+        if row["variant_id"] is not None:
+            snapshot["approvals"] = self._layer_approvals(row["variant_id"], row["layer"])
+        return {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": snapshot}
 
     def export_collation(self, work_id: int, user_id: int) -> dict:
         if not self.can_view_work(work_id, user_id):
@@ -410,6 +485,8 @@ class CollationDB:
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
+                variant["approvals"] = self._layer_approvals(row["id"], row["layer"])
+                variant["endorsed"] = len({a["reviewer_id"] for a in variant["approvals"]}) >= REQUIRED_APPROVALS
                 variants.append(variant)
             passages.append({**dict(passage), "alignments": alignments, "variants": variants})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}

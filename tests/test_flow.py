@@ -23,9 +23,59 @@ class CollationFlowTest(unittest.TestCase):
         exported=self.db.export_collation(self.work,self.reviewer)
         self.assertEqual(1,exported["gap_count"])
         self.assertTrue(exported["passages"][0]["variants"][0]["notes"] == [])
+        self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        self.db.approve_variant(variant,self.owner,"同意当前取舍")
+        self.db.approve_variant(variant,self.reviewer,"复核无误")
         self.db.lock_passage(self.passage,self.owner,"定稿")
+        snap=self.db.get_snapshot(self.passage,2,self.owner)
+        self.assertEqual(["负责人","审阅"],[a["reviewer_name"] for a in snap["snapshot"]["approvals"]])
+        self.assertEqual("复核无误",snap["snapshot"]["approvals"][1]["comment"])
+        exported=self.db.export_collation(self.work,self.reviewer)
+        self.assertTrue(exported["passages"][0]["variants"][0]["endorsed"])
+        self.assertEqual("同意当前取舍",exported["passages"][0]["variants"][0]["approvals"][0]["comment"])
         with self.assertRaisesRegex(DomainError,"锁定"):
             self.db.update_variant(variant,"另一文本","无意义修改",self.editor,2)
+    def test_endorsement_required_before_lock(self):
+        second=self.db.add_user("审阅乙","reviewer")
+        self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        self.db.grant_work_access(self.work,second,"review",self.owner)
+        variant=self.db.create_variant(self.passage,self.w2,"春水东流，故人南去。","按语义补足",self.editor,0)
+        with self.assertRaisesRegex(DomainError,"认可"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        with self.assertRaisesRegex(DomainError,"审阅权限"):
+            self.db.approve_variant(variant,self.outsider,"外部评语")
+        self.db.grant_work_access(self.work,self.editor,"review",self.owner)
+        with self.assertRaisesRegex(DomainError,"录入人"):
+            self.db.approve_variant(variant,self.editor,"录入人自评")
+        with self.assertRaisesRegex(DomainError,"评语"):
+            self.db.approve_variant(variant,self.reviewer,"  ")
+        self.db.approve_variant(variant,self.reviewer,"文从字顺")
+        with self.assertRaisesRegex(DomainError,"已认可"):
+            self.db.approve_variant(variant,self.reviewer,"重复认可")
+        with self.assertRaisesRegex(DomainError,"认可"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        self.db.approve_variant(variant,second,"同意此层")
+        self.db.lock_passage(self.passage,self.owner,"定稿")
+        with self.assertRaisesRegex(DomainError,"锁定"):
+            self.db.approve_variant(variant,self.owner,"锁定后认可")
+    def test_endorsement_voided_after_content_change(self):
+        second=self.db.add_user("审阅乙","reviewer")
+        self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        self.db.grant_work_access(self.work,second,"review",self.owner)
+        variant=self.db.create_variant(self.passage,self.w2,"补足文本","按语义补足",self.editor,0)
+        self.db.approve_variant(variant,self.reviewer,"第一层的认可")
+        self.db.approve_variant(variant,second,"第一层复核")
+        self.db.update_variant(variant,"改后的文本","墨迹重勘后改写",self.editor,1)
+        with self.assertRaisesRegex(DomainError,"认可"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual([],exported["passages"][0]["variants"][0]["approvals"])
+        self.assertFalse(exported["passages"][0]["variants"][0]["endorsed"])
+        snap=self.db.get_snapshot(self.passage,1,self.owner)
+        self.assertEqual({"第一层的认可","第一层复核"},{a["comment"] for a in snap["snapshot"]["approvals"]})
+        self.db.approve_variant(variant,self.reviewer,"第二层认可")
+        self.db.approve_variant(variant,second,"第二层复核")
+        self.db.lock_passage(self.passage,self.owner,"定稿")
     def test_optimistic_lock_permission_and_mark_validation(self):
         first=self.db.create_variant(self.passage,self.w2,"补足一","理由一",self.editor,0)
         with self.assertRaisesRegex(DomainError,"版本冲突"):
