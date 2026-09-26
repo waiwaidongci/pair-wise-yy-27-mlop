@@ -144,6 +144,15 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS endorsements (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+              layer INTEGER NOT NULL,
+              reviewer_id INTEGER NOT NULL REFERENCES users(id),
+              comment TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(variant_id,layer,reviewer_id)
+            );
             """
         )
         self.conn.commit()
@@ -221,6 +230,12 @@ class CollationDB:
         owner = self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (row["work_id"], user_id)).fetchone()
         editor = self.conn.execute("SELECT 1 FROM witness_editors WHERE witness_id=? AND user_id=?", (witness_id, user_id)).fetchone()
         return bool(owner or editor)
+
+    def can_review_work(self, work_id: int, user_id: int) -> bool:
+        return bool(self.conn.execute(
+            "SELECT 1 FROM work_access WHERE work_id=? AND user_id=? AND permission='review'",
+            (work_id, user_id),
+        ).fetchone())
 
     def add_witness(self, work_id: int, siglum: str, kind: str, source_note: str = "", missing_sections: str = "") -> int:
         if not self.conn.execute("SELECT 1 FROM works WHERE id=?", (work_id,)).fetchone():
@@ -367,11 +382,62 @@ class CollationDB:
             )
         return int(cur.lastrowid)
 
+    def _current_layer_author(self, variant: sqlite3.Row) -> int:
+        row = self.conn.execute(
+            "SELECT author_id FROM revisions WHERE variant_id=? ORDER BY id DESC LIMIT 1",
+            (variant["id"],),
+        ).fetchone()
+        return int(row["author_id"]) if row else int(variant["created_by"])
+
+    def _current_endorsements(self, variant_id: int, layer: int) -> list:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT e.id,e.variant_id,e.layer,e.reviewer_id,u.name AS reviewer,e.comment,e.created_at "
+            "FROM endorsements e JOIN users u ON u.id=e.reviewer_id "
+            "WHERE e.variant_id=? AND e.layer=? ORDER BY e.id",
+            (variant_id, layer),
+        ).fetchall()]
+
+    def _endorsement_shortfall(self, passage_id: int) -> list:
+        missing = []
+        for row in self.conn.execute("SELECT id,layer FROM variants WHERE passage_id=? ORDER BY id", (passage_id,)).fetchall():
+            count = int(self.conn.execute(
+                "SELECT COUNT(DISTINCT reviewer_id) FROM endorsements WHERE variant_id=? AND layer=?",
+                (row["id"], row["layer"]),
+            ).fetchone()[0])
+            if count < 2:
+                missing.append(row["id"])
+        return missing
+
+    def endorse_variant(self, variant_id: int, user_id: int, comment: str) -> None:
+        with self.transaction():
+            variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+            if not variant:
+                raise DomainError("异文记录不存在")
+            passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (variant["passage_id"],)).fetchone()
+            if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage["id"],)).fetchone():
+                raise DomainError("段落已锁定，不能修改")
+            if not self.can_review_work(passage["work_id"], user_id):
+                raise DomainError("无权审阅该作品")
+            if user_id == self._current_layer_author(variant):
+                raise DomainError("录入人不能认可自己录入的异文")
+            if not comment.strip():
+                raise DomainError("评语不能为空")
+            try:
+                self.conn.execute(
+                    "INSERT INTO endorsements(variant_id,layer,reviewer_id,comment,created_at) VALUES(?,?,?,?,?)",
+                    (variant_id, variant["layer"], user_id, comment.strip(), datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该审阅人已认可过当前层") from exc
+
     def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        missing = self._endorsement_shortfall(passage_id)
+        if missing:
+            raise DomainError(f"异文 {','.join(map(str, missing))} 未获两名审阅人认可，不能定稿")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
@@ -386,7 +452,10 @@ class CollationDB:
         row = self.conn.execute("SELECT * FROM revisions WHERE passage_id=? AND revision_no=?", (passage_id, revision_no)).fetchone()
         if not row:
             raise DomainError("快照不存在")
-        return {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": json.loads(row["snapshot_json"])}
+        result = {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": json.loads(row["snapshot_json"])}
+        if row["variant_id"]:
+            result["endorsements"] = self._current_endorsements(row["variant_id"], row["layer"])
+        return result
 
     def export_collation(self, work_id: int, user_id: int) -> dict:
         if not self.can_view_work(work_id, user_id):
@@ -410,6 +479,7 @@ class CollationDB:
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
+                variant["endorsements"] = self._current_endorsements(row["id"], row["layer"])
                 variants.append(variant)
             passages.append({**dict(passage), "alignments": alignments, "variants": variants})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
